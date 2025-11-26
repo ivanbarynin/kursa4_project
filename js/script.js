@@ -1,42 +1,52 @@
 import * as THREE from "https://unpkg.com/three@0.163.0/build/three.module.js";
 
-let scene, camera, renderer;
-let reticle, hitTestSource = null, hitTestSourceRequested = false;
-let placedObject = null;
+let renderer, scene, camera;
+let reticle;
+let hitTestSource = null;
+let viewerSpace = null;
 
-// Логи hit-test
+let xrRefSpace = null;
+
 const hitTestLog = [];
 
-init();
-startRendering();
+initScene();
 
-function init() {
+document.getElementById("enter-ar").onclick = startAR;
+document.getElementById("download-log").onclick = downloadLog;
+
+
+// ========================
+//     INIT SCENE
+// ========================
+function initScene() {
   scene = new THREE.Scene();
 
   camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
 
-  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.xr.enabled = true;
+
   document.body.appendChild(renderer.domElement);
 
   // Reticle
   reticle = new THREE.Mesh(
-    new THREE.RingGeometry(0.08, 0.1, 32).rotateX(-Math.PI/2),
+    new THREE.RingGeometry(0.07, 0.1, 32).rotateX(-Math.PI/2),
     new THREE.MeshBasicMaterial({ color: 0x00ff00 })
   );
-  reticle.visible = false;
-  reticle.matrixAutoUpdate = false;
-  scene.add(reticle);
 
-  document.getElementById("ar-button").addEventListener("click", startAR);
-  document.getElementById("download-log").addEventListener("click", downloadLog);
+  reticle.matrixAutoUpdate = false;
+  reticle.visible = false;
+  scene.add(reticle);
 }
 
-// ======== Запуск AR-сессии с камерой ========
+
+// ========================
+//     START AR SESSION
+// ========================
 async function startAR() {
   if (!navigator.xr) {
-    alert("WebXR не поддерживается в этом браузере.");
+    alert("WebXR не поддерживается.");
     return;
   }
 
@@ -45,110 +55,113 @@ async function startAR() {
       requiredFeatures: ["hit-test", "local"]
     });
 
-    // Подключаем WebGL к камере
     const gl = renderer.getContext();
     await gl.makeXRCompatible();
-    session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+
+    session.updateRenderState({
+      baseLayer: new XRWebGLLayer(session, gl)
+    });
 
     renderer.xr.setSession(session);
 
-    session.addEventListener("end", () => {
-      hitTestSourceRequested = false;
-      hitTestSource = null;
-    });
+    // Reference space
+    xrRefSpace = await session.requestReferenceSpace("local");
+
+    // Hit-test setup
+    viewerSpace = await session.requestReferenceSpace("viewer");
+    hitTestSource = await session.requestHitTestSource({ space: viewerSpace });
+
+    // XR render loop
+    session.requestAnimationFrame(onXRFrame);
+
+    window.addEventListener("click", placeObject);
 
   } catch (e) {
     alert("Ошибка запуска AR: " + e);
   }
 }
 
-// ======== Render loop ========
-function startRendering() {
-  renderer.setAnimationLoop(render);
-}
 
-function render(timestamp, frame) {
-  if (!frame) return;
+// ========================
+//     XR FRAME LOOP
+// ========================
+function onXRFrame(t, frame) {
+  const session = frame.session;
+  session.requestAnimationFrame(onXRFrame);
 
-  const referenceSpace = renderer.xr.getReferenceSpace();
+  const pose = frame.getViewerPose(xrRefSpace);
 
-  // Запрашиваем hit-test source один раз
-  if (!hitTestSourceRequested) {
-    const session = renderer.xr.getSession();
-    if (!session) return;
-
-    session.requestReferenceSpace("viewer").then(viewerSpace => {
-      session.requestHitTestSource({ space: viewerSpace }).then(source => {
-        hitTestSource = source;
-      });
-    });
-
-    hitTestSourceRequested = true;
+  // Если камера не работает — pose будет NULL
+  if (!pose) {
+    console.warn("NO CAMERA FEED (pose == null)");
+    renderer.render(scene, camera);
+    return;
   }
 
-  if (hitTestSource) {
-    const hitResults = frame.getHitTestResults(hitTestSource);
+  const hitResults = frame.getHitTestResults(hitTestSource);
 
-    if (hitResults.length > 0) {
-      const hit = hitResults[0];
-      const pose = hit.getPose(referenceSpace);
+  if (hitResults.length > 0) {
+    const hit = hitResults[0];
+    const poseHit = hit.getPose(xrRefSpace);
 
-      reticle.visible = true;
-      reticle.matrix.fromArray(pose.transform.matrix);
+    reticle.visible = true;
+    reticle.matrix.fromArray(poseHit.transform.matrix);
 
-      // Логируем данные
-      const pos = pose.transform.position;
-      const rot = pose.transform.orientation;
-      hitTestLog.push({
-        timestamp,
-        position: { x: pos.x, y: pos.y, z: pos.z },
-        rotation: { x: rot.x, y: rot.y, z: rot.z, w: rot.w },
-        browser: navigator.userAgent,
-        reticleVisible: true
-      });
+    const pos = poseHit.transform.position;
+    const rot = poseHit.transform.orientation;
 
-      // Размещение объекта по тапу
-      window.addEventListener("click", placeObjectOnReticle, { once: true });
-    } else {
-      reticle.visible = false;
-      hitTestLog.push({
-        timestamp,
-        position: null,
-        rotation: null,
-        browser: navigator.userAgent,
-        reticleVisible: false
-      });
-    }
+    hitTestLog.push({
+      time: performance.now(),
+      pos: { x: pos.x, y: pos.y, z: pos.z },
+      rot: { x: rot.x, y: rot.y, z: rot.z, w: rot.w },
+      visible: true
+    });
+  } else {
+    reticle.visible = false;
+
+    hitTestLog.push({
+      time: performance.now(),
+      pos: null,
+      rot: null,
+      visible: false
+    });
   }
 
   renderer.render(scene, camera);
 }
 
-// ======== Размещение объекта ========
-function placeObjectOnReticle() {
+
+// ========================
+//     PLACE OBJECT
+// ========================
+function placeObject() {
   if (!reticle.visible) return;
 
-  if (!placedObject) {
-    placedObject = new THREE.Mesh(
-      new THREE.BoxGeometry(0.1, 0.1, 0.1),
-      new THREE.MeshPhongMaterial({ color: 0xff0000 })
-    );
+  const cube = new THREE.Mesh(
+    new THREE.BoxGeometry(0.1, 0.1, 0.1),
+    new THREE.MeshStandardMaterial({ color: 0xff0000 })
+  );
 
-    const light = new THREE.HemisphereLight(0xffffff, 0x444444);
-    scene.add(light);
-    scene.add(placedObject);
-  }
+  cube.position.setFromMatrixPosition(reticle.matrix);
 
-  placedObject.position.setFromMatrixPosition(reticle.matrix);
+  const light = new THREE.HemisphereLight(0xffffff, 0x444444);
+  scene.add(light);
+
+  scene.add(cube);
 }
 
-// ======== Скачать лог hit-test ========
+
+// ========================
+//     DOWNLOAD LOG
+// ========================
 function downloadLog() {
   const blob = new Blob([JSON.stringify(hitTestLog, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
+
   const a = document.createElement("a");
   a.href = url;
-  a.download = "hit_test_log.json";
+  a.download = "hit-test-log.json";
   a.click();
+
   URL.revokeObjectURL(url);
 }
