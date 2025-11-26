@@ -1,167 +1,128 @@
-import * as THREE from "https://unpkg.com/three@0.163.0/build/three.module.js";
-
-let renderer, scene, camera;
-let reticle;
+let scene, camera, renderer;
 let hitTestSource = null;
-let viewerSpace = null;
+let hitTestSourceRequested = false;
 
-let xrRefSpace = null;
-
-const hitTestLog = [];
-
-initScene();
-
-document.getElementById("enter-ar").onclick = startAR;
-document.getElementById("download-log").onclick = downloadLog;
-
-
-// ========================
-//     INIT SCENE
-// ========================
-function initScene() {
-  scene = new THREE.Scene();
-
-  camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
-
-  renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  renderer.xr.enabled = true;
-
-  document.body.appendChild(renderer.domElement);
-
-  // Reticle
-  reticle = new THREE.Mesh(
-    new THREE.RingGeometry(0.07, 0.1, 32).rotateX(-Math.PI/2),
-    new THREE.MeshBasicMaterial({ color: 0x00ff00 })
-  );
-
-  reticle.matrixAutoUpdate = false;
-  reticle.visible = false;
-  scene.add(reticle);
+const logEl = document.getElementById("log");
+function log(msg) {
+    logEl.textContent += msg + "\n";
+    logEl.scrollTop = logEl.scrollHeight;
 }
 
+document.getElementById("clear-log").onclick = () => {
+    logEl.textContent = "";
+};
 
-// ========================
-//     START AR SESSION
-// ========================
+init();
+runDiagnostics(renderer);
+
+function init() {
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+    renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.xr.enabled = true;
+
+    document.body.appendChild(renderer.domElement);
+}
+
+async function runDiagnostics(renderer) {
+    const dWebXR = document.getElementById("diag-webxr");
+    const dAR = document.getElementById("diag-ar");
+    const dHit = document.getElementById("diag-hit");
+    const dCam = document.getElementById("diag-camera");
+    const dGL = document.getElementById("diag-gl");
+
+    // WebXR support
+    if ("xr" in navigator) dWebXR.textContent = "✓ Supported";
+    else dWebXR.textContent = "❌ Not Available";
+
+    // AR session support
+    if (navigator.xr) {
+        try {
+            const supported = await navigator.xr.isSessionSupported("immersive-ar");
+            dAR.textContent = supported ? "✓ Supported" : "❌ Not Supported";
+        } catch {
+            dAR.textContent = "⚠️ Error";
+        }
+    }
+
+    // Hit test support
+    try {
+        const temp = await navigator.xr.requestSession("inline", {
+            optionalFeatures: ["hit-test"]
+        });
+        dHit.textContent = "✓ Supported";
+        await temp.end();
+    } catch {
+        dHit.textContent = "❌ Not Available";
+    }
+
+    // Camera access check
+    try {
+        await navigator.mediaDevices.getUserMedia({ video: true });
+        dCam.textContent = "✓ OK";
+    } catch {
+        dCam.textContent = "❌ Blocked";
+    }
+
+    // WebGL XR compatible
+    try {
+        const gl = renderer.getContext();
+        await gl.makeXRCompatible();
+        dGL.textContent = "✓ Compatible";
+    } catch {
+        dGL.textContent = "❌ Failed";
+    }
+}
+
+document.getElementById("start-ar").onclick = startAR;
+
 async function startAR() {
-  if (!navigator.xr) {
-    alert("WebXR не поддерживается.");
-    return;
-  }
+    if (!navigator.xr) {
+        alert("WebXR not supported");
+        return;
+    }
 
-  try {
     const session = await navigator.xr.requestSession("immersive-ar", {
-      requiredFeatures: ["hit-test", "local"]
+        requiredFeatures: ["local", "hit-test"]
     });
 
     const gl = renderer.getContext();
     await gl.makeXRCompatible();
 
     session.updateRenderState({
-      baseLayer: new XRWebGLLayer(session, gl)
+        baseLayer: new XRWebGLLayer(session, gl)
     });
 
     renderer.xr.setSession(session);
 
-    // Reference space
-    xrRefSpace = await session.requestReferenceSpace("local");
+    const referenceSpace = await session.requestReferenceSpace("local");
+    const viewerSpace = await session.requestReferenceSpace("viewer");
 
-    // Hit-test setup
-    viewerSpace = await session.requestReferenceSpace("viewer");
     hitTestSource = await session.requestHitTestSource({ space: viewerSpace });
+    hitTestSourceRequested = true;
 
-    // XR render loop
+    session.requestAnimationFrame(onXRFrame);
+}
+
+function onXRFrame(time, frame) {
+    const session = frame.session;
     session.requestAnimationFrame(onXRFrame);
 
-    window.addEventListener("click", placeObject);
+    const refSpace = renderer.xr.getReferenceSpace();
+    const pose = frame.getViewerPose(refSpace);
 
-  } catch (e) {
-    alert("Ошибка запуска AR: " + e);
-  }
-}
+    if (pose) {
+        const hitTestResults = frame.getHitTestResults(hitTestSource);
 
+        if (hitTestResults.length > 0) {
+            const hit = hitTestResults[0];
+            const pose = hit.getPose(refSpace);
 
-// ========================
-//     XR FRAME LOOP
-// ========================
-function onXRFrame(t, frame) {
-  const session = frame.session;
-  session.requestAnimationFrame(onXRFrame);
+            log(`Hit: ${pose.transform.position.x.toFixed(3)}, ${pose.transform.position.y.toFixed(3)}, ${pose.transform.position.z.toFixed(3)}`);
+        }
+    }
 
-  const pose = frame.getViewerPose(xrRefSpace);
-
-  // Если камера не работает — pose будет NULL
-  if (!pose) {
-    console.warn("NO CAMERA FEED (pose == null)");
     renderer.render(scene, camera);
-    return;
-  }
-
-  const hitResults = frame.getHitTestResults(hitTestSource);
-
-  if (hitResults.length > 0) {
-    const hit = hitResults[0];
-    const poseHit = hit.getPose(xrRefSpace);
-
-    reticle.visible = true;
-    reticle.matrix.fromArray(poseHit.transform.matrix);
-
-    const pos = poseHit.transform.position;
-    const rot = poseHit.transform.orientation;
-
-    hitTestLog.push({
-      time: performance.now(),
-      pos: { x: pos.x, y: pos.y, z: pos.z },
-      rot: { x: rot.x, y: rot.y, z: rot.z, w: rot.w },
-      visible: true
-    });
-  } else {
-    reticle.visible = false;
-
-    hitTestLog.push({
-      time: performance.now(),
-      pos: null,
-      rot: null,
-      visible: false
-    });
-  }
-
-  renderer.render(scene, camera);
-}
-
-
-// ========================
-//     PLACE OBJECT
-// ========================
-function placeObject() {
-  if (!reticle.visible) return;
-
-  const cube = new THREE.Mesh(
-    new THREE.BoxGeometry(0.1, 0.1, 0.1),
-    new THREE.MeshStandardMaterial({ color: 0xff0000 })
-  );
-
-  cube.position.setFromMatrixPosition(reticle.matrix);
-
-  const light = new THREE.HemisphereLight(0xffffff, 0x444444);
-  scene.add(light);
-
-  scene.add(cube);
-}
-
-
-// ========================
-//     DOWNLOAD LOG
-// ========================
-function downloadLog() {
-  const blob = new Blob([JSON.stringify(hitTestLog, null, 2)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = "hit-test-log.json";
-  a.click();
-
-  URL.revokeObjectURL(url);
 }
